@@ -15,43 +15,15 @@ translators:
 ---
 
 # 混合专家模型 (MoE) 详解
-
 随着 Mixtral 8x7B ([announcement](https://mistral.ai/news/mixtral-of-experts/), [model card](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)) 的推出，一种称为混合专家模型 (Mixed Expert Models，简称 MoEs) 的 Transformer 模型在开源人工智能社区引起了广泛关注。在本篇博文中，我们将深入探讨 MoEs 的核心组件、训练方法，以及在推理过程中需要考量的各种因素。
 
-让我们开始吧！
 
-## 目录
+> **简短总结**: 混合专家模型 (MoEs):
+> - 与稠密模型相比， **预训练速度更快**
+> - 与具有相同参数数量的模型相比，具有更快的 **推理速度**
+> - 需要 **大量显存**，因为所有专家系统都需要加载到内存中
+> - 在 **微调方面存在诸多挑战**，但 [近期的研究](https://arxiv.org/pdf/2305.14705.pdf) 表明，对混合专家模型进行 **指令调优具有很大的潜力**。
 
-- [什么是混合专家模型？](#什么是混合专家模型)
-- [混合专家模型简史](#混合专家模型简史)
-- [什么是稀疏性？](#什么是稀疏性)
-- [混合专家模型中令牌的负载均衡](#混合专家模型中令牌的负载均衡)
-- [MoEs and Transformers](#moes-and-transformers)
-- [Switch Transformers](#switch-transformers)
-- [用Router z-loss稳定模型训练](#用router-z-loss稳定模型训练)
-- [专家如何学习？](#专家如何学习)
-- [专家的数量对预训练有何影响？](#专家的数量对预训练有何影响)
-- [微调混合专家模型](#微调混合专家模型)
-- [稀疏 VS 稠密，如何选择?](#稀疏-VS-稠密如何选择)
-- [让MoE起飞](#让moe起飞)
-  - [并行计算](#并行计算)
-  - [容量因子和通信开销](#容量因子和通信开销)
-  - [部署技术](#部署技术)
-  - [高效训练](#高效训练)
-- [开源混合专家模型](#开源混合专家模型)
-- [一些有趣的研究方向](#一些有趣的研究方向)
-- [相关资源](#相关资源)
-
-## 简短总结
-
-混合专家模型 (MoEs):
-
-- 与稠密模型相比， **预训练速度更快**
-- 与具有相同参数数量的模型相比，具有更快的 **推理速度**
-- 需要 **大量显存**，因为所有专家系统都需要加载到内存中
-- 在 **微调方面存在诸多挑战**，但 [近期的研究](https://arxiv.org/pdf/2305.14705.pdf) 表明，对混合专家模型进行 **指令调优具有很大的潜力**。
-
-让我们开始吧！
 
 ## 什么是混合专家模型？
 
@@ -69,14 +41,31 @@ translators:
   <figcaption>[Switch Transformers paper](https://arxiv.org/abs/2101.03961) 论文中的 MoE layer</figcaption>
 </figure>
 
-总结来说，在混合专家模型 (MoE) 中，我们将传统 Transformer 模型中的每个前馈网络 (FFN) 层替换为 MoE 层，其中 MoE 层由两个核心部分组成: 一个门控网络和若干数量的专家。
+**总结来说，在混合专家模型 (MoE) 中，我们将传统 Transformer 模型中的每个前馈网络 (FFN) 层替换为 MoE 层，其中 MoE 层由两个核心部分组成: 一个门控网络和若干数量的专家。**
 
 尽管混合专家模型 (MoE) 提供了若干显著优势，例如更高效的预训练和与稠密模型相比更快的推理速度，但它们也伴随着一些挑战:
-
 - **训练挑战**: 虽然 MoE 能够实现更高效的计算预训练，但它们在微调阶段往往面临泛化能力不足的问题，长期以来易于引发过拟合现象。
 - **推理挑战**: MoE 模型虽然可能拥有大量参数，但在推理过程中只使用其中的一部分，这使得它们的推理速度快于具有相同数量参数的稠密模型。然而，这种模型需要将所有参数加载到内存中，因此对内存的需求非常高。以 Mixtral 8x7B 这样的 MoE 为例，需要足够的 VRAM 来容纳一个 47B 参数的稠密模型。之所以是 47B 而不是 8 x 7B = 56B，是因为在 MoE 模型中，只有 FFN 层被视为独立的专家，而模型的其他参数是共享的。此外，假设每个令牌只使用两个专家，那么推理速度 (以 FLOPs 计算) 类似于使用 12B 模型 (而不是 14B 模型)，因为虽然它进行了 2x7B 的矩阵乘法计算，但某些层是共享的。
 
-了解了 MoE 的基本概念后，让我们进一步探索推动这类模型发展的研究。
+
+## MoE层包含哪些组件
+在基于 Transformer 结构的混合专家模型（Mixture of Experts, MoE）中，MoE 层主要包含以下几个核心组件：
+> 1. 专家网络（Experts）
+- **定义与构成**：专家网络是 MoE 层的基础组成部分，通常由多个前馈网络（FFN）构成。每个专家网络本质上是一个独立的全连接神经网络，具有自己的一组可学习参数（权重和偏置）。例如，在一个简单的设置中，每个专家可能是一个包含两层线性变换和一个非线性激活函数（如 ReLU）的 FFN，其结构与传统 Transformer 中的 FFN 类似，但在 MoE 中多个这样的 FFN 并行存在。
+- **功能**：不同的专家网络可以学习到输入数据的不同特征和模式。它们就像不同领域的专家，各自擅长处理输入数据的某一部分特征。例如，在自然语言处理任务中，有些专家可能擅长处理语义信息，而有些专家可能更擅长处理语法结构信息。
+
+> 2. 门控网络（Gating Network）
+- **定义与构成**：门控网络是一个可学习的神经网络，用于决定将输入的每个令牌（token）分配给哪些专家进行处理。它接收输入序列的特征表示，并输出每个专家对应的权重。常见的门控机制有简单的基于 softmax 函数的门控和带噪声的 Top-K 门控(本文有介绍)等。例如，对于有 \(n\) 个专家的 MoE 层，门控网络会输出一个长度为 \(n\) 的向量，向量中的每个元素表示对应专家的权重。
+- **功能**：门控网络的主要功能是实现稀疏性，即根据输入的不同动态地选择激活部分专家，而不是让所有专家都处理所有输入。这样可以在减少计算量的同时，让模型能够根据输入的特点自适应地利用不同专家的能力。例如，在处理一篇关于科技的文章时，门控网络可能会将更多的令牌分配给擅长处理科技领域知识的专家。
+
+> 3. 路由机制（Routing Mechanism）
+- **定义与构成**：路由机制基于门控网络的输出，将输入的令牌实际分配给相应的专家。它根据门控网络给出的权重，决定哪些专家将接收哪些令牌进行处理。在一些简单的情况下，路由机制可能只是简单地将令牌分配给权重最高的专家；而在更复杂的设置中，如 Top - K 门控，会将令牌分配给权重最高的 \(K\) 个专家。
+- **功能**：路由机制确保输入数据能够准确地被传递到合适的专家网络进行处理，从而实现模型的稀疏计算和自适应能力。它是连接门控网络和专家网络的桥梁，保证了整个 MoE 层的正常运行。
+
+> 4. 辅助损失（Auxiliary Loss）
+- **定义与构成**：辅助损失是为了解决门控网络可能出现的负载不均衡问题而引入的一种损失函数。它鼓励门控网络将输入均匀地分配给各个专家，避免出现某些专家被频繁使用，而其他专家很少被激活的情况。常见的辅助损失计算方式是衡量每个专家接收的令牌数量与平均令牌数量之间的差异。
+- **功能**：通过在训练过程中加入辅助损失，可以提高模型的训练效率和稳定性，使所有专家都能得到充分的训练，从而提升整个 MoE 模型的性能。 
+
 
 ## 混合专家模型简史
 
@@ -90,7 +79,7 @@ translators:
 这些研究的融合促进了在自然语言处理 (NLP) 领域对混合专家模型的探索。特别是在 2017 年，[Shazeer 等人](https://arxiv.org/abs/1701.06538) (团队包括 Geoffrey Hinton 和 Jeff Dean，后者有时被戏称为 [“谷歌的 Chuck Norris”](https://www.informatika.bg/jeffdean)) 将这一概念应用于 137B 的 LSTM (当时被广泛应用于 NLP 的架构，由 Schmidhuber 提出)。通过引入稀疏性，这项工作在保持极高规模的同时实现了快速的推理速度。这项工作主要集中在翻译领域，但面临着如高通信成本和训练不稳定性等多种挑战。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/01_moe_layer.png" alt="MoE layer in LSTM">
+  <img src="./f-images/01_moe_layer.png" alt="MoE layer in LSTM">
   <figcaption>Outrageously Large Neural Network 论文中的 MoE layer</figcaption>
 </figure>
 
@@ -98,7 +87,7 @@ translators:
 
 ## 什么是稀疏性?
 
-稀疏性的概念采用了条件计算的思想。在传统的稠密模型中，所有的参数都会对所有输入数据进行处理。相比之下，稀疏性允许我们仅针对整个系统的某些特定部分执行计算。这意味着并非所有参数都会在处理每个输入时被激活或使用，而是根据输入的特定特征或需求，只有部分参数集合被调用和运行。
+稀疏性的概念采用了条件计算的思想。在传统的稠密模型中，所有的参数都会对所有输入数据进行处理。相比之下，稀疏性允许我们仅针对整个系统的某些特定部分执行计算。这意味着并非所有参数都会在处理每个输入时被激活或使用，而是**根据输入的特定特征或需求，只有部分参数集合被调用和运行**。
 
 让我们深入分析 Shazeer 对混合专家模型 (MoE) 在翻译应用中的贡献。条件计算的概念 (即仅在每个样本的基础上激活网络的不同部分) 使得在不增加额外计算负担的情况下扩展模型规模成为可能。这一策略在每个 MoE 层中实现了数以千计甚至更多的专家的有效利用。
 
@@ -110,38 +99,158 @@ $$
 y = \sum_{i=1}^{n} G(x)_i E_i(x)
 $$
 
-在这种设置下，虽然所有专家都会对所有输入进行运算，但通过门控网络的输出进行加权乘法操作。但是，如果 G (门控网络的输出) 为 0 会发生什么呢？如果是这种情况，就没有必要计算相应的专家操作，因此我们可以节省计算资源。那么一个典型的门控函数是什么呢？一个典型的门控函数通常是一个带有 softmax 函数的简单的网络。这个网络将学习将输入发送给哪个专家。
+在这种设置下，虽然所有专家都会对所有输入进行运算，但通过门控网络的输出进行加权乘法操作。但是，如果 $G$ (门控网络的输出) 为 $0$ 会发生什么呢？如果是这种情况，就没有必要计算相应的专家操作，因此我们可以节省计算资源。那么一个典型的门控函数是什么呢？一个典型的门控函数通常是一个带有 $softmax$ 函数的简单的网络。这个网络将学习将输入发送给哪个专家。
 
 $$
 G_\sigma(x) = \text{Softmax}(x \cdot W_g)
 $$
 
-Shazeer 等人的工作还探索了其他的门控机制，其中包括带噪声的 TopK 门控 (Noisy Top-K Gating)。这种门控方法引入了一些可调整的噪声，然后保留前 k 个值。具体来说:
-
-1. 添加一些噪声
-
-$$
+Shazeer 等人的工作还探索了其他的门控机制，其中包括带噪声的 Top-K 门控 (Noisy Top-K Gating)。这种门控方法引入了一些可调整的噪声，然后保留前 k 个值。具体来说:
+- 1. 添加一些噪声
+> $$
 H(x)_i = (x \cdot W_{\text{g}})_i + \text{StandardNormal()} \cdot \text{Softplus}((x \cdot W_{\text{noise}})_i)
 $$
 
-2. 选择保留前 K 个值
-
-$$
+- 2. 选择保留前 K 个值
+> $$
 \text{KeepTopK}(v, k)_i = \begin{cases}
 v_i & \text{if } v_i \text{ is in the top } k \text{ elements of } v, \\
 -\infty & \text{otherwise.}
 \end{cases}
 $$
 
-3. 应用 Softmax 函数
-
-$$
+- 3. 应用 Softmax 函数
+> $$
 G(x) = \text{Softmax}(\text{KeepTopK}(H(x), k))
 $$
 
-这种稀疏性引入了一些有趣的特性。通过使用较低的 k 值 (例如 1 或 2)，我们可以比激活多个专家时更快地进行训练和推理。为什么不仅选择最顶尖的专家呢？最初的假设是，需要将输入路由到不止一个专家，以便门控学会如何进行有效的路由选择，因此至少需要选择两个专家。[Switch Transformers](#switch-transformers) 就这点进行了更多的研究。
+这种稀疏性引入了一些有趣的特性。通过使用较低的 $k$ 值 (例如 1 或 2)，我们可以比激活多个专家时更快地进行训练和推理。为什么不仅选择最顶尖的专家呢？最初的假设是，需要将输入路由到不止一个专家，以便门控学会如何进行有效的路由选择，因此至少需要选择两个专家。[Switch Transformers](#switch-transformers) 就这点进行了更多的研究。
 
 我们为什么要添加噪声呢？这是为了专家间的负载均衡！
+
+## 可学习的门控
+在混合专家模型（Mixture of Experts, MoE）的MoE层里，门控网络起着关键作用，它决定了输入令牌该分配给哪些专家进行处理。以下详细介绍几种常见的门控网络具体实现方式.
+
+### 简单Softmax门控
+#### 原理
+简单Softmax门控是最基础的门控机制之一。门控网络接收输入特征，通过一个线性变换将其映射到专家数量的维度，然后应用Softmax函数将输出转换为概率分布，这个概率分布就代表了每个专家被选中的概率。
+
+#### 公式
+假设输入为 $x$，线性变换的权重矩阵为 $W_g$，偏置向量为 $b_g$，专家数量为 $N$。则门控网络的输出 $g(x)$ 计算如下：
+1. 线性变换：$z = xW_g + b_g$
+2. Softmax函数：$g(x)_i=\frac{\exp(z_i)}{\sum_{j = 1}^{N}\exp(z_j)}$，其中 $i = 1,2,\cdots,N$
+
+#### 代码示例（使用PyTorch）
+```python
+import torch
+import torch.nn as nn
+
+# 假设输入维度为input_dim，专家数量为num_experts
+input_dim = 512
+num_experts = 8
+
+# 定义线性层
+gating_linear = nn.Linear(input_dim, num_experts)
+softmax = nn.Softmax(dim=-1)
+
+# 假设输入x是一个批次的序列，形状为 (batch_size, seq_len, input_dim)
+batch_size = 32
+seq_len = 10
+x = torch.randn(batch_size, seq_len, input_dim)
+
+# 线性变换
+z = gating_linear(x)
+# 应用Softmax函数
+g = softmax(z)
+```
+
+### 带噪声的Top - K门控
+#### 原理
+简单 Softmax 门控可能会导致大部分令牌都被分配给少数几个专家，为了解决这个问题，引入了带噪声的 Top-K 门控。这种门控机制在计算过程中加入了噪声，使得选择更加随机化，然后选择得分最高的 $K$ 个专家进行处理。
+
+#### 公式
+1. 加入噪声：
+$$H(x)_i=(x\cdot W_{g})_i+\text{StandardNormal()}\cdot\text{Softplus}((x\cdot W_{\text{noise}})_i)$$
+
+2. 选择 Top-K：
+$$\text{KeepTopK}(v,k)_i=\begin{cases}v_i&\text{if }v_i\text{ is in the top }k\text{ elements of }v\\-\infty&\text{otherwise}\end{cases}$$
+
+3. 应用Softmax：
+$$G(x)=\text{Softmax}(\text{KeepTopK}(H(x),k))$$
+
+#### 代码示例（使用PyTorch）
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 假设输入维度为input_dim，专家数量为num_experts，K值为k
+input_dim = 512
+num_experts = 8
+k = 2
+
+# 定义线性层
+gating_linear = nn.Linear(input_dim, num_experts)
+noise_linear = nn.Linear(input_dim, num_experts)
+
+# 假设输入x是一个批次的序列，形状为 (batch_size, seq_len, input_dim)
+batch_size = 32
+seq_len = 10
+x = torch.randn(batch_size, seq_len, input_dim)
+
+# 线性变换
+z = gating_linear(x)
+noise = noise_linear(x)
+noise = F.softplus(noise) * torch.randn_like(noise)
+h = z + noise
+
+# 选择Top - K
+top_k_values, top_k_indices = torch.topk(h, k, dim=-1)
+mask = torch.zeros_like(h)
+mask.scatter_(-1, top_k_indices, 1)
+h = h.masked_fill(mask == 0, -float('inf'))
+
+# 应用Softmax函数
+g = F.softmax(h, dim=-1)
+```
+
+### 基于注意力机制的门控
+#### 原理
+这种门控机制借鉴了Transformer中的注意力机制，通过计算输入与一组可学习的查询向量之间的注意力分数，来确定每个专家的权重。
+
+#### 公式
+假设查询向量为 $Q$，键向量为输入特征 $x$ 经过线性变换后的结果 $K = xW_k$，值向量为 $V$（通常与 $K$ 相同）。注意力分数 $A$ 计算如下：
+1. 计算注意力分数：$A=\text{Softmax}(\frac{QK^T}{\sqrt{d_k}})$
+2. 得到门控权重：$g = AV$
+
+#### 代码示例（使用PyTorch）
+```python
+import torch
+import torch.nn as nn
+
+# 假设输入维度为input_dim，专家数量为num_experts，查询向量维度为d_k
+input_dim = 512
+num_experts = 8
+d_k = 64
+
+# 定义线性层
+key_linear = nn.Linear(input_dim, d_k)
+query_vectors = nn.Parameter(torch.randn(num_experts, d_k))
+
+# 假设输入x是一个批次的序列，形状为 (batch_size, seq_len, input_dim)
+batch_size = 32
+seq_len = 10
+x = torch.randn(batch_size, seq_len, input_dim)
+
+# 计算键向量
+k = key_linear(x)
+
+# 计算注意力分数
+scores = torch.matmul(query_vectors, k.transpose(-2, -1)) / (d_k ** 0.5)
+g = torch.softmax(scores, dim=-1)
+```
+
+这些门控网络的实现方式各有优缺点，在实际应用中需要根据具体任务和数据特点进行选择和调整。 
 
 ## 混合专家模型中令牌的负载均衡
 
@@ -154,7 +263,7 @@ Transformer 类模型明确表明，增加参数数量可以提高性能，因�
 GShard 将在编码器和解码器中的每个前馈网络 (FFN) 层中的替换为使用 Top-2 门控的混合专家模型 (MoE) 层。下图展示了编码器部分的结构。这种架构对于大规模计算非常有效: 当扩展到多个设备时，MoE 层在不同设备间共享，而其他所有层则在每个设备上复制。我们将在 [“让 MoE 起飞”](#让moe起飞) 部分对这一点进行更详细的讨论。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/02_moe_block.png" alt="MoE Transformer Encoder">
+  <img src="./f-images//02_moe_block.png" alt="MoE Transformer Encoder">
   <figcaption>GShard 论文中的 MoE Transformer Encoder</figcaption>
 </figure>
 
@@ -172,7 +281,7 @@ GShard 的工作对适用于 MoE 的并行计算模式也做出了重要贡献�
 尽管混合专家模型 (MoE) 显示出了很大的潜力，但它们在训练和微调过程中存在稳定性问题。[Switch Transformers](https://arxiv.org/abs/2101.03961) 是一项非常激动人心的工作，它深入研究了这些话题。作者甚至在 Hugging Face 上发布了一个 [1.6 万亿参数的 MoE](https://huggingface.co/google/switch-c-2048)，拥有 2048 个专家，你可以使用 `transformers` 库来运行它。Switch Transformers 实现了与 T5-XXL 相比 4 倍的预训练速度提升。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/03_switch_layer.png" alt="Switch Transformer Layer">
+  <img src="./f-images/03_switch_layer.png" alt="Switch Transformer Layer">
   <figcaption>Switch Transformer 论文中的 Switch Transformer Layer</figcaption>
 </figure>
 
@@ -191,14 +300,14 @@ $$
 \text{Expert Capacity} = \left(\frac{\text{tokens per batch}}{\text{number of experts}}\right) \times \text{capacity factor}
 $$
 
-上述建议的容量是将批次中的令牌数量均匀分配到各个专家。如果我们使用大于 1 的容量因子，我们为令牌分配不完全平衡时提供了一个缓冲。增加容量因子会导致更高的设备间通信成本，因此这是一个需要考虑的权衡。特别值得注意的是，Switch Transformers 在低容量因子 (例如 1 至 1.25) 下表现出色。
+上述建议的容量是将批次中的令牌数量均匀分配到各个专家。如果我们使用大于 1 的**容量因子(capacity factor)**，我们为令牌分配不完全平衡时提供了一个缓冲。增加容量因子会导致更高的设备间通信成本，因此这是一个需要考虑的权衡。特别值得注意的是，Switch Transformers 在低容量因子 (例如 1 至 1.25) 下表现出色。
 
 Switch Transformer 的作者还重新审视并简化了前面章节中提到的负载均衡损失。在训练期间，对于每个 Switch 层的辅助损失被添加到总模型损失中。这种损失鼓励均匀路由，并可以使用超参数进行加权。
 
 作者还尝试了混合精度的方法，例如用 `bfloat16` 精度训练专家，同时对其余计算使用全精度进行。较低的精度可以减少处理器间的通信成本、计算成本以及存储张量的内存。然而，在最初的实验中，当专家和门控网络都使用 `bfloat16` 精度训练时，出现了不稳定的训练现象。这种不稳定性特别是由路由计算引起的，因为路由涉及指数函数等操作，这些操作对精度要求较高。因此，为了保持计算的稳定性和精确性，保持更高的精度是重要的。为了减轻不稳定性，路由过程也使用了全精度。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/04_switch_table.png" alt="Table shows that selective precision does not degrade quality.">
+  <img src="./f-images/04_switch_table.png" alt="Table shows that selective precision does not degrade quality.">
   <figcaption>使用混合精度不会降低模型质量并可实现更快的训练</figcaption>
 </figure>
 
@@ -217,7 +326,7 @@ Switch Transformers 采用了编码器 - 解码器的架构，实现了与 T5 �
 ST-MoE 的研究者们发现，编码器中不同的专家倾向于专注于特定类型的令牌或浅层概念。例如，某些专家可能专门处理标点符号，而其他专家则专注于专有名词等。与此相反，解码器中的专家通常具有较低的专业化程度。此外，研究者们还对这一模型进行了多语言训练。尽管人们可能会预期每个专家处理一种特定语言，但实际上并非如此。由于令牌路由和负载均衡的机制，没有任何专家被特定配置以专门处理某一特定语言。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/05_experts_learning.png" alt="Experts specialize in some token groups">
+  <img src="./f-images/05_experts_learning.png" alt="Experts specialize in some token groups">
   <figcaption>ST-MoE 论文中显示了哪些令牌组被发送给了哪个专家的表格</figcaption>
 </figure>
 
@@ -236,21 +345,21 @@ ST-MoE 的研究者们发现，编码器中不同的专家倾向于专注于特�
 Switch Transformers 的作者观察到，在相同的预训练困惑度下，稀疏模型在下游任务中的表现不如对应的稠密模型，特别是在重理解任务 (如 SuperGLUE) 上。另一方面，对于知识密集型任务 (如 TriviaQA)，稀疏模型的表现异常出色。作者还观察到，在微调过程中，较少的专家的数量有助于改善性能。另一个关于泛化问题确认的发现是，模型在小型任务上表现较差，但在大型任务上表现良好。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/06_superglue_curves.png" alt="Fine-tuning learning curves">
+  <img src="./f-images/06_superglue_curves.png" alt="Fine-tuning learning curves">
   <figcaption>在小任务 (左图) 中，我们可以看到明显的过拟合，因为稀疏模型在验证集中的表现要差得多。在较大的任务 (右图) 中，MoE 则表现良好。该图来自 ST-MoE 论文</figcaption>
 </figure>
 
 一种可行的微调策略是尝试冻结所有非专家层的权重。实践中，这会导致性能大幅下降，但这符合我们的预期，因为混合专家模型 (MoE) 层占据了网络的主要部分。我们可以尝试相反的方法: 仅冻结 MoE 层的参数。实验结果显示，这种方法几乎与更新所有参数的效果相当。这种做法可以加速微调过程，并降低显存需求。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/07_superglue_bars.png" alt="Only updating the non MoE layers works well in fine-tuning">
+  <img src="./f-images/07_superglue_bars.png" alt="Only updating the non MoE layers works well in fine-tuning">
   <figcaption>通过仅冻结 MoE 层，我们可以在保持质量的同时加快训练速度。该图来自 ST-MoE 论文</figcaption>
 </figure>
 
 在微调稀疏混合专家模型 (MoE) 时需要考虑的最后一个问题是，它们有特别的微调超参数设置——例如，稀疏模型往往更适合使用较小的批量大小和较高的学习率，这样可以获得更好的训练效果。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/08_superglue_dense_vs_sparse.png" alt="Table comparing fine-tuning batch size and learning rate between dense and sparse models.">
+  <img src="./f-images/08_superglue_dense_vs_sparse.png" alt="Table comparing fine-tuning batch size and learning rate between dense and sparse models.">
   <figcaption>提高学习率和调小批量可以提升稀疏模型微调质量。该图来自 ST-MoE 论文</figcaption>
 </figure>
 
@@ -263,7 +372,7 @@ Switch Transformers 的作者观察到，在相同的预训练困惑度下，稀
 当研究者们对 MoE 和对应性能相当的 T5 模型进行微调时，他们发现 T5 的对应模型表现更为出色。然而，当研究者们对 Flan T5 (一种 T5 的指令优化版本) 的 MoE 版本进行微调时，MoE 的性能显著提升。更值得注意的是，Flan-MoE 相比原始 MoE 的性能提升幅度超过了 Flan T5 相对于原始 T5 的提升，这意味着 MoE 模型可能从指令式微调中获益更多，甚至超过了稠密模型。此外，MoE 在多任务学习中表现更佳。与之前关闭 **辅助损失** 函数的做法相反，实际上这种损失函数可以帮助防止过拟合。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/09_fine_tune_evals.png" alt="MoEs benefit even more from instruct tuning than dense models">
+  <img src="./f-images/09_fine_tune_evals.png" alt="MoEs benefit even more from instruct tuning than dense models">
   <figcaption>与稠密模型相比，稀疏模型从指令微调中受益更多。该图来自 MoEs Meets instructions Tuning 论文</figcaption>
 </figure>
 
@@ -289,7 +398,7 @@ Switch Transformers 的作者观察到，在相同的预训练困惑度下，稀
 在专家并行中，专家被放置在不同的节点上，每个节点处理不同批次的训练样本。对于非 MoE 层，专家并行的行为与数据并行相同。对于 MoE 层，序列中的令牌被发送到拥有所需专家的节点。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/10_parallelism.png" alt="Image illustrating model, expert, and data prallelism">
+  <img src="./f-images/10_parallelism.png" alt="Image illustrating model, expert, and data prallelism">
   <figcaption>Switch Transformers 论文中展示如何使用不同的并行技术在节点上分割数据和模型的插图</figcaption>
 </figure>
 
@@ -314,7 +423,7 @@ FasterMoE (2022 年 3 月) 深入分析了 MoE 在不同并行策略下的理论
 Megablocks (2022 年 11 月) 则专注于通过开发新的 GPU kernel 来处理 MoE 模型中的动态性，以实现更高效的稀疏预训练。其核心优势在于，它不会丢弃任何令牌，并能高效地适应现代硬件架构 (支持块稀疏矩阵乘)，从而达到显著的加速效果。Megablocks 的创新之处在于，它不像传统 MoE 那样使用批量矩阵乘法 (这通常假设所有专家形状相同且处理相同数量的令牌)，而是将 MoE 层表示为块稀疏操作，可以灵活适应不均衡的令牌分配。
 
 <figure class="image text-center">
-  <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/moe/11_expert_matmuls.png" alt="Matrix multiplication optimized for block-sparse operations.">
+  <img src="./f-images/11_expert_matmuls.png" alt="Matrix multiplication optimized for block-sparse operations.">
   <figcaption>针对不同规模的专家和令牌数量的块稀疏矩阵乘法。该图来自 [MegaBlocks](https://arxiv.org/abs/2211.15841) 论文</figcaption>
 </figure>
 
